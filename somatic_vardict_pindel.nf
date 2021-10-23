@@ -92,7 +92,7 @@ def chemo_radio_rs_vcf = file("${genome_dir}variation_hotspots/chemotherapy_radi
 def chemo_radio_rs_bed = file("${genome_dir}variation_hotspots/chemotherapy_radiotherapy_rs_v1.0.bed")
 def rs_1p19q_bed = file("${genome_dir}mgmt/1p19q.rs.bed")
 def cosmic_database = "${genome_dir}snpsift/CosmicCodingMuts.vcf.gz"
-def clinvar_database = "${genome_dir}snpsift/clinvar_20210511.vcf.gz"
+def clinvar_database = "${genome_dir}snpsift/clinvar_20210828.vcf.gz"
 def gnomad_database = "${genome_dir}snpsift/b37_af-only-gnomad.raw.sites.vcf"
 def dbsnp_database = "${genome_dir}snpsift/dbsnp_138.b37.vcf"
 def core_hotspots_bed = "${genome_dir}variation_hotspots/core_hotspots_v1.0.bed"
@@ -132,6 +132,7 @@ def cnv_oncocnv_conf = file("${prefix_conf_dir}/software/cnv/oncocnv/conf/somati
 def anno_snpeff_conf = file("${prefix_conf_dir}/software/annotation/SnpEff/conf/snpeff_canon_only.conf")
 def perbase_conf = file("${prefix_conf_dir}/software/calling/perbase/conf/perbase_standard.conf")
 def somatic_vardict_conf = "${prefix_conf_dir}/software/calling/VarDict/conf/ctdna_standard.conf"
+def secondary_annotate_conf = file("${gatk_toolkit_dir}annotation/conf/secondary_bam_annotate.conf")
 
 
 process preprocess_fastp_tumor_standard {
@@ -359,7 +360,7 @@ process control_align_bwa_sort {
 }
 
 process refinement_process_tumor_standard {
-     container '10.168.2.67:5000/gatk-yy:4.1.7.2'
+     container '10.168.2.67:5000/gatk-yy:4.2.0.0'
 
      cpus params.threads/2
      memory { 20.GB * memory_scale1 * task.attempt }
@@ -387,7 +388,7 @@ process refinement_process_tumor_standard {
 }
 
 process dedup_refinement_process_tumor {
-     container '10.168.2.67:5000/gatk-yy:4.1.7.2'
+     container '10.168.2.67:5000/gatk-yy:4.2.0.0'
      publishDir "${unified_bam_dir}", mode: 'copy'
 
      cpus params.threads
@@ -404,8 +405,8 @@ process dedup_refinement_process_tumor {
           path 'target.bed' from bed_target
 
      output:
-          path "${tumor_dedup_bam}" into tumor_dedup_bam_ch1
-          path "${tumor_dedup_bai}" into tumor_dedup_bai_ch1
+          path "${tumor_dedup_bam}" into tumor_dedup_bam_ch1, tumor_dedup_bam_ch2
+          path "${tumor_dedup_bai}" into tumor_dedup_bai_ch1, tumor_dedup_bai_ch2
 
      script:
           tumor_dedup_bam = "${params.SampleId}_tumor_dedup.bam"
@@ -420,7 +421,7 @@ process dedup_refinement_process_tumor {
 
 
 process refinement_process_control_standard {
-     container '10.168.2.67:5000/gatk-yy:4.1.7.2'
+     container '10.168.2.67:5000/gatk-yy:4.2.0.0'
      publishDir "${unified_bam_dir}", mode: 'copy'
 
      cpus params.threads/2
@@ -453,7 +454,7 @@ process refinement_process_control_standard {
 }
 
 process dedup_refinement_process_control {
-     container '10.168.2.67:5000/gatk-yy:4.1.7.2'
+     container '10.168.2.67:5000/gatk-yy:4.2.0.0'
      publishDir "${unified_bam_dir}", mode: 'copy'
 
      cpus params.threads
@@ -573,8 +574,36 @@ process vardict_variation_tumor_only {
      """
      cat ${somatic_vardict_conf} | xargs java -Xmx12g -XX:-UseParallelGC -jar /opt/VarDict-1.8.2.jar -b refined.bam -G ${ref_fa} -th ${task.cpus} -N ${params.SampleId} -hotspot ${vardict_hotspots_list} -c 1 -S 2 -E 3 target.bed > "${params.SampleId}_vardict.var"
      cat "${params.SampleId}_vardict.var" | /opt/teststrandbias.R | /opt/var2vcf_valid.pl -N ${params.SampleId} -A -E -f 0.00085 > raw_vardict_tumor.vcf
-     bcftools sort -o ${vardict_out_vcf} raw_vardict_tumor.vcf
+     bcftools sort raw_vardict_tumor.vcf | awk -F "\t" '{if (\$4 != "." && \$5 != "." && \$5 !~ /^</) print \$0}' > ${vardict_out_vcf}
      """
+}
+
+process secondary_filter_annotation_tumor_only {
+    container '10.168.2.67:5000/gatk-yy:4.2.2.1'
+
+    cpus 2
+    memory { 8.GB * task.attempt }
+
+    errorStrategy { task.exitStatus in 125..140 ? 'retry' : 'ignore' }
+    maxRetries 3
+    
+    when:
+        params.ctl_fq1 == ""
+
+    input:
+        path 'tumor_deduped.bam' from tumor_dedup_bam_ch2
+        path 'tumor_deduped.bai' from tumor_dedup_bai_ch2
+        path 'raw_sorted.vcf' from vardict_out_ch
+
+    output:
+        path "${secondary_stats_vcf}" into vardict_add_stats_ch
+    
+    script:
+        secondary_stats_vcf = "${params.SampleId}_vardict_stats.vcf"
+    """
+    cat ${secondary_annotate_conf} | xargs \
+    gatk VariantAnnotator -I tumor_deduped.bam -R ${ref_fa} -V raw_sorted.vcf -O ${secondary_stats_vcf}
+    """
 }
 
 process anno_snpeff_tumor_only2 {
@@ -590,7 +619,8 @@ process anno_snpeff_tumor_only2 {
          params.ctl_fq1 == ""
 
      input:
-         path "raw_vardict_var.vcf" from vardict_out_ch
+         path "raw_vardict_var.vcf" from vardict_add_stats_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
        
      output:
          path "${prefix_anno_vcf}_vardict_hgvs.vcf" into tumor_anno_vcf_ch2
@@ -600,7 +630,7 @@ process anno_snpeff_tumor_only2 {
          prefix_anno_vcf = "${params.SampleId}_raw"
 
      """
-     cat ${anno_snpeff_conf} | xargs \
+     cat anno_snpeff.conf | xargs \
      java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
              -haplotype-ouput ${prefix_anno_vcf}.haplotype.anno GRCh37.p13.RefSeq raw_vardict_var.vcf > ${prefix_anno_vcf}_vardict_hgvs.vcf
 
@@ -858,8 +888,37 @@ process somatic_vardict_paired_parallel {
          vardict_out_vcf = "${params.SampleId}_raw_vardict.vcf"
      """
      cat ${somatic_vardict_conf} | xargs java -Xmx12g -XX:-UseParallelGC -jar /opt/VarDict-1.8.2.jar -b "refined.bam|control.bam" -G ${ref_fa} -th ${task.cpus} -N ${params.SampleId} -hotspot ${vardict_hotspots_list} -c 1 -S 2 -E 3 target.bed > "${params.SampleId}_vardict.var"
-     cat "${params.SampleId}_vardict.var" | /opt/testsomatic.R | /opt/var2vcf_paired.pl -N "${params.SampleId}|${params.SampleId}_X" -A -f 0.00085 > ${vardict_out_vcf}
+     cat "${params.SampleId}_vardict.var" | /opt/testsomatic.R | /opt/var2vcf_paired.pl -N "${params.SampleId}|${params.SampleId}_X" -A -f 0.00085 > raw_vardict_tumor.vcf
+     bcftools sort raw_vardict_tumor.vcf | awk -F "\t" '{if (\$4 != "." && \$5 != "." && \$5 !~ /^</) print \$0}' > ${vardict_out_vcf}
      """
+}
+
+process secondary_filter_annotation_paired {
+    container '10.168.2.67:5000/gatk-yy:4.2.2.1'
+
+    cpus 2
+    memory { 8.GB * task.attempt }
+
+    errorStrategy { task.exitStatus in 125..140 ? 'retry' : 'ignore' }
+    maxRetries 3
+    
+    when:
+        params.ctl_fq1 != ""
+
+    input:
+        path 'tumor_deduped.bam' from tumor_dedup_bam_ch2
+        path 'tumor_deduped.bai' from tumor_dedup_bai_ch2
+        path 'paired_raw_sorted.vcf' from paired_vardict_ch
+
+    output:
+        path "${secondary_stats_vcf}" into vardict_stats_paired_ch
+
+    script:
+        secondary_stats_vcf = "${params.SampleId}_vardict_stats.vcf"
+    """
+    cat ${secondary_annotate_conf} | xargs \
+    gatk VariantAnnotator -I tumor_deduped.bam -R ${ref_fa} -V paired_raw_sorted.vcf -O ${secondary_stats_vcf}
+    """
 }
 
 process anno_snpeff_somatic_paired {
@@ -875,8 +934,9 @@ process anno_snpeff_somatic_paired {
          params.ctl_fq1 != ""
 
      input:
-         path "paired_vardict_var.vcf" from paired_vardict_ch
-       
+         path "paired_vardict_var.vcf" from vardict_stats_paired_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
+
      output:
          path "${prefix_anno_vcf}_vardict_hgvs.vcf" into paired_anno_vcf_ch
          path "${prefix_anno_vcf}.haplotype.anno" into haplotype_pseudo_ch
@@ -885,7 +945,7 @@ process anno_snpeff_somatic_paired {
          prefix_anno_vcf = "${params.SampleId}_raw"
 
      """
-     cat ${anno_snpeff_conf} | xargs \
+     cat anno_snpeff.conf | xargs \
      java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
              -haplotype-ouput ${prefix_anno_vcf}.haplotype.anno GRCh37.p13.RefSeq paired_vardict_var.vcf > ${prefix_anno_vcf}_vardict_hgvs.vcf
 
@@ -1495,6 +1555,7 @@ process anno_snpeff_paired {
 
      input:
          path 'raw_snp_indel.vcf' from raw_paired_vcf_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
      output:
          path '*.anno' into haplotype_anno_paired_ch
@@ -1504,7 +1565,7 @@ process anno_snpeff_paired {
         prefix_anno_vcf = "${params.SampleId}_raw"
 
      """
-     cat ${anno_snpeff_conf} | xargs \
+     cat anno_snpeff.conf | xargs \
      java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
              -haplotype-ouput ${prefix_anno_vcf}.haplotype.anno GRCh37.p13.RefSeq raw_snp_indel.vcf > ${prefix_anno_vcf}_snp_indel_hgvs.vcf
 
@@ -1526,6 +1587,7 @@ process anno_snpeff_dedup_paired {
 
      input:
          path 'raw_dedup_snp_indel.vcf' from dedup_raw_paired_vcf_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
      output:
          path '*_snp_indel_hgvs.vcf' into dedup_all_anno_paired_ch
@@ -1534,7 +1596,7 @@ process anno_snpeff_dedup_paired {
         prefix_anno_vcf = "${params.SampleId}_raw_dedup"
 
      """
-     cat ${anno_snpeff_conf} | xargs \
+     cat anno_snpeff.conf | xargs \
      java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
              -haplotype-ouput ${prefix_anno_vcf}_dedup.haplotype.anno GRCh37.p13.RefSeq raw_dedup_snp_indel.vcf > ${prefix_anno_vcf}_snp_indel_hgvs.vcf 
      """
@@ -1555,6 +1617,7 @@ process anno_snpeff_tumor_only {
 
      input:
          path 'raw_snp_indel.vcf' from raw_tumor_vcf_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
        
      output:
          path '*snp_indel_hgvs.vcf' into tumor_anno_vcf_ch
@@ -1564,7 +1627,7 @@ process anno_snpeff_tumor_only {
 
 
      """
-     cat ${anno_snpeff_conf} | xargs \
+     cat anno_snpeff.conf | xargs \
      java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
              -haplotype-ouput ${prefix_anno_vcf}.haplotype.anno GRCh37.p13.RefSeq raw_snp_indel.vcf > ${prefix_anno_vcf}_snp_indel_hgvs.vcf
 
@@ -1585,6 +1648,7 @@ process anno_tumor_dedup_snpeff {
 
      input:
          path 'raw_dedup_snp_indel.vcf' from dedup_raw_tumor_vcf_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
        
      output:
          path '*snp_indel_hgvs.vcf' into dedup_tumor_anno_vcf_ch
@@ -1593,7 +1657,7 @@ process anno_tumor_dedup_snpeff {
         prefix_anno_vcf = "${params.SampleId}_raw_dedup"
 
      """
-     cat ${anno_snpeff_conf} | xargs \
+     cat anno_snpeff.conf | xargs \
      java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
              -haplotype-ouput ${prefix_anno_vcf}_dedup.haplotype.anno GRCh37.p13.RefSeq raw_dedup_snp_indel.vcf > ${prefix_anno_vcf}_snp_indel_hgvs.vcf
      """
@@ -1733,15 +1797,16 @@ process anno_indels_snpeff {
 
      input:
          path 'raw_indels.vcf' from pindel_vcf_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
      output:
          path '*_pindel_hgvs.vcf' into pindel_anno_vcf_ch
 
      script:
-        prefix_anno_vcf = "${params.SampleId}"
+         prefix_anno_vcf = "${params.SampleId}"
 
      """
-     cat ${anno_snpeff_conf} | xargs \
+     cat anno_snpeff.conf | xargs \
      java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
              -haplotype-ouput ${prefix_anno_vcf}.haplotype.anno GRCh37.p13.RefSeq raw_indels.vcf > ${prefix_anno_vcf}_pindel_hgvs.vcf
 
@@ -1959,6 +2024,7 @@ process anno_germline_snpeff_control {
     
     input:
          path 'germline_control.vcf' from germline_paired_vcf_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
     output:
          path "${germline_anno_vcf}" into germline_anno_ch
@@ -1967,7 +2033,7 @@ process anno_germline_snpeff_control {
         germline_anno_vcf = "${params.SampleId}_germline.vcf"
     """
     python3 /opt/vcf_multiple_split.py germline_control.vcf germline_control_splitted.vcf
-    cat ${anno_snpeff_conf} | xargs \
+    cat anno_snpeff.conf | xargs \
     java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
                      -haplotype-ouput haplotype.anno GRCh37.p13.RefSeq germline_control_splitted.vcf > ${germline_anno_vcf}
     """
@@ -1989,6 +2055,7 @@ process anno_germline_snpeff_tumor {
     
     input:
          path 'germline_tumor.vcf' from germline_tumor_vcf_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
     output:
          path "${germline_tumor_anno_vcf}" into tumor_germline_anno_ch
@@ -1997,7 +2064,7 @@ process anno_germline_snpeff_tumor {
         germline_tumor_anno_vcf = "${params.SampleId}_germline_tumor.vcf"
     """
     python3 /opt/vcf_multiple_split.py germline_tumor.vcf germline_tumor_splitted.vcf
-    cat ${anno_snpeff_conf} | xargs \
+    cat anno_snpeff.conf | xargs \
     java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
                      -haplotype-ouput haplotype.anno GRCh37.p13.RefSeq germline_tumor_splitted.vcf > ${germline_tumor_anno_vcf}
     """
@@ -2338,6 +2405,7 @@ process chemotherapy_anno_germline_snpeff_tumor {
     
     input:
          path 'germline_tumor.vcf' from tumor_germline_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
     output:
          path "${germline_tumor_anno_vcf}" into tumor_germline_rs_ch
@@ -2349,7 +2417,7 @@ process chemotherapy_anno_germline_snpeff_tumor {
         tumor_radio_xls = "${params.SampleId}_radiotherapy_rs.xls"
     """
     python3 /opt/vcf_multiple_split.py germline_tumor.vcf germline_tumor_splitted.vcf
-    cat ${anno_snpeff_conf} | xargs \
+    cat anno_snpeff.conf | xargs \
     java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
                      -haplotype-ouput haplotype.anno GRCh37.p13.RefSeq germline_tumor_splitted.vcf > ${germline_tumor_anno_vcf}
     python3 /opt/chemotherapy_to_report.py germline_tumor.vcf ${chemotherapy_rs_vcf} ${tumor_chemo_xls}
@@ -2373,6 +2441,7 @@ process chemotherapy_anno_germline_snpeff_control {
     
     input:
          path 'germline_control.vcf' from control_germline_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
     output:
          path "${germline_anno_vcf}" into germline_control_rs_ch
@@ -2384,7 +2453,7 @@ process chemotherapy_anno_germline_snpeff_control {
         germline_radio_xls = "${params.SampleId}_radiotherapy_rs.xls"
     """
     python3 /opt/vcf_multiple_split.py germline_control.vcf germline_control_splitted.vcf
-    cat ${anno_snpeff_conf} | xargs \
+    cat anno_snpeff.conf | xargs \
     java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
                      -haplotype-ouput haplotype.anno GRCh37.p13.RefSeq germline_control_splitted.vcf > ${germline_anno_vcf}
     python3 /opt/chemotherapy_to_report.py germline_control.vcf ${chemotherapy_rs_vcf} ${germline_chemo_xls} 

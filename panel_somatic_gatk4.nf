@@ -94,7 +94,7 @@ def chemotherapy_rs_bed = file("${genome_dir}variation_hotspots/chemotherapy_rs_
 def radiotherapy_rs_vcf = file("${genome_dir}variation_hotspots/radiotherapy_rs_v1.0.vcf")
 def chemo_radio_rs_vcf = file("${genome_dir}variation_hotspots/chemotherapy_radiotherapy_rs_v1.0.vcf")
 def chemo_radio_rs_bed = file("${genome_dir}variation_hotspots/chemotherapy_radiotherapy_rs_v1.0.bed")
-def clinvar_vcf_conf = file("${genome_dir}snpsift/clinvar_20210511.vcf.gz")
+def clinvar_vcf_conf = file("${genome_dir}snpsift/clinvar_20210828.vcf.gz")
 def variation_hotspots_conf = file("${genome_dir}variation_hotspots/yunying_hotspots_GRCh37_v1.0.txt")
 def msi_database_dir = "${genome_dir}/msi/${params.msi_db}"
 
@@ -113,6 +113,7 @@ somatic_calling_conf = params.high_recall ? "somatic_high_depth_cfdna.conf" : "s
 trim_in_conf = params.high_recall ? "trim_include_conservative.conf" : "trim_include_standard.conf"
 trim_ex_conf = params.high_recall ? "trim_exclude_conservative2.conf" : "trim_exclude_standard.conf"
 def mutect2_conf = file("${gatk_toolkit_dir}somatic/conf/${somatic_calling_conf}")
+def secondary_annotate_conf = file("${gatk_toolkit_dir}annotation/conf/secondary_bam_annotate.conf")
 def germline_calling_conf = file("${gatk_toolkit_dir}germline/conf/haplotype_caller.conf")
 def anno_snpeff_conf = file("${prefix_conf_dir}/software/annotation/SnpEff/conf/snpeff_canon_only.conf")
 def somatic_filter_conf = file("${gatk_toolkit_dir}filter/conf/somatic_high_recall.conf")
@@ -325,8 +326,8 @@ process refinement_gatk_elprep_control_standard {
           path 'target.bed' from bed_target
 
      output:
-          path "${recal_bam}" into ctl_recal_bam_ch1, ctl_recal_bam_ch2, ctl_recal_bam_ch3, ctl_recal_bam_ch4, ctl_recal_bam_ch5
-          path "${recal_bai}" into ctl_recal_bai_ch1, ctl_recal_bai_ch2, ctl_recal_bai_ch3, ctl_recal_bai_ch4, ctl_recal_bai_ch5
+          path "${recal_bam}" into ctl_recal_bam_ch1, ctl_recal_bam_ch2, ctl_recal_bam_ch4
+          path "${recal_bai}" into ctl_recal_bai_ch1, ctl_recal_bai_ch2, ctl_recal_bai_ch4
 
      script:
           recal_bam = "${params.SampleId}_ctl_recal.bam"
@@ -492,9 +493,51 @@ process cnv_oncocnv_tumor_covers {
      """
 }
 
-process germline_gatk4_for_control {
+process refinement_enzyme_correct_control {
      container '10.168.2.67:5000/gatk-yy:4.2.0.0'
      publishDir "${unified_bam_dir}", mode: 'copy', pattern: '*.{bam,bai}'
+ 
+     cpus 2
+     memory { 8.GB * task.attempt }
+ 
+     errorStrategy { task.exitStatus in 1..140 ? 'retry' : 'terminate' }
+     maxRetries 5
+     
+     when:
+          params.ctl_fq1 != ""
+ 
+     input:
+          path 'ctl_recal.bam' from ctl_recal_bam_ch1
+          path 'ctl_recal.bai' from ctl_recal_bai_ch1
+          path 'target.bed' from bed_target
+          path 'chemo_radio_rs.bed' from chemo_radio_rs_bed
+ 
+     output:
+          path "${ctl_correct_bam}" into control_refined_bam_ch1, control_refined_bam_ch2
+          path "${ctl_correct_bai}" into control_refined_bai_ch1, control_refined_bai_ch2
+          path "merged.interval_list" into merged_region_ch
+ 
+     script:
+          ctl_correct_bam = "${params.SampleId}_ctl_recal.bam"
+          ctl_correct_bai = "${params.SampleId}_ctl_recal.bai"
+
+     if (params.SampleId =~ "PCR_")
+        """
+        cp -d ctl_recal.bam ${ctl_correct_bam}
+        cp -d ctl_recal.bai ${ctl_correct_bai}
+        """
+     else
+        """
+        java -jar /gatk/gatk-package-4.1.7.0-local.jar BedToIntervalList -I target.bed -O germline.interval_list -SD ${ref_fa_dict}
+        java -jar /gatk/gatk-package-4.1.7.0-local.jar BedToIntervalList -I chemo_radio_rs.bed -O chemo_radio_therapy.interval_list -SD ${ref_fa_dict}
+        java -jar /gatk/gatk-package-4.1.7.0-local.jar IntervalListTools --ACTION UNION -I germline.interval_list -I chemo_radio_therapy.interval_list -O merged.interval_list
+
+        recsc -r ${ref_fa} -g merged.interval_list -i ctl_recal.bam -o ${ctl_correct_bam}
+        """
+}
+
+process germline_gatk4_for_control {
+     container '10.168.2.67:5000/gatk-yy:4.2.0.0'
 
      cpus 2
      memory { 8.GB * task.attempt }
@@ -506,28 +549,17 @@ process germline_gatk4_for_control {
           params.ctl_fq1 != ""
 
      input:
-          path 'ctl_recal.bam' from ctl_recal_bam_ch5
-          path 'ctl_recal.bai' from ctl_recal_bai_ch5
-          path 'target.bed' from bed_target
-          path 'chemo_radio_rs.bed' from chemo_radio_rs_bed
+          path 'ctl_recal.bam' from control_refined_bam_ch2
+          path 'ctl_recal.bai' from control_refined_bai_ch2
+          path 'merged.interval_list' from merged_region_ch
 
      output:
-          path "${control_correct_bam}" into control_refined_bam_ch
-          path "${control_correct_bai}" into control_refined_bai_ch
           path "${germline_vcf}" into control_germline_ch
 
      script:
-          control_correct_bam = "${params.SampleId}_ctl_recal.bam"
-          control_correct_bai = "${params.SampleId}_ctl_recal.bai"
           germline_vcf = "${params.SampleId}_germline_for_control.vcf"
      """
-     java -jar /gatk/gatk-package-4.1.7.0-local.jar BedToIntervalList -I target.bed -O germline.interval_list -SD ${ref_fa_dict}
-     java -jar /gatk/gatk-package-4.1.7.0-local.jar BedToIntervalList -I chemo_radio_rs.bed -O chemo_radio_therapy.interval_list -SD ${ref_fa_dict}
-     java -jar /gatk/gatk-package-4.1.7.0-local.jar IntervalListTools --ACTION UNION -I germline.interval_list -I chemo_radio_therapy.interval_list -O merged.interval_list
-
-     recsc -r ${ref_fa} -g merged.interval_list -i ctl_recal.bam -o ${control_correct_bam}
-
-     gatk HaplotypeCaller -I ${control_correct_bam} -R ${ref_fa} \
+     gatk HaplotypeCaller -I ctl_recal.bam -R ${ref_fa} \
              -D ${gatk_db_dir}/dbsnp_138.b37.vcf --alleles ${chemo_radio_rs_vcf} \
              -L merged.interval_list -stand-call-conf 10 \
              --interval-padding 20 -A AlleleFraction -O ${germline_vcf}
@@ -600,7 +632,7 @@ process statistic_sinotools_tumor_only {
 
 
 process somatic_gatk_interval_split {
-     container '10.168.2.67:5000/gatk-yy:4.1.7.2'
+     container '10.168.2.67:5000/gatk-yy:4.2.0.0'
      
      cpus 1
      memory { 2.GB * task.attempt }
@@ -678,9 +710,9 @@ process germline_gatk4_for_tumor {
      script:
           tumor_germline_vcf = "${params.SampleId}_germline_for_tumor.vcf"
      """
-     java -jar /gatk/gatk-package-4.1.7.0-local.jar BedToIntervalList -I target.bed -O germline.interval_list -SD ${ref_fa_dict}
-     java -jar /gatk/gatk-package-4.1.7.0-local.jar BedToIntervalList -I chemo_radio_rs.bed -O chemo_radio_therapy.interval_list -SD ${ref_fa_dict}
-     java -jar /gatk/gatk-package-4.1.7.0-local.jar IntervalListTools --ACTION UNION -I germline.interval_list -I chemo_radio_therapy.interval_list -O merged.interval_list
+     java -jar /gatk/gatk-package-4.2.2.0-local.jar BedToIntervalList -I target.bed -O germline.interval_list -SD ${ref_fa_dict}
+     java -jar /gatk/gatk-package-4.2.2.0-local.jar BedToIntervalList -I chemo_radio_rs.bed -O chemo_radio_therapy.interval_list -SD ${ref_fa_dict}
+     java -jar /gatk/gatk-package-4.2.2.0-local.jar IntervalListTools --ACTION UNION -I germline.interval_list -I chemo_radio_therapy.interval_list -O merged.interval_list
 
      gatk HaplotypeCaller -I tumor_refined.bam -R ${ref_fa} \
              -D ${gatk_db_dir}/dbsnp_138.b37.vcf --alleles ${chemo_radio_rs_vcf} \
@@ -690,7 +722,7 @@ process germline_gatk4_for_tumor {
 }
 
 process somatic_gatk_mutect2_parallel_paired {
-    container '10.168.2.67:5000/gatk-yy:4.2.0.0'
+    container '10.168.2.67:5000/gatk-yy:4.2.2.1'
 
     cpus 2
     memory { 8.GB * task.attempt }
@@ -704,7 +736,8 @@ process somatic_gatk_mutect2_parallel_paired {
     input:
           path 'tumor_refined.bam' from tumor_correct_bam_ch1
           path 'tumor_refined.bai' from tumor_correct_bai_ch1
-          path 'ctl_recal.bam' from ctl_recal_bam_ch1
+          path 'ctl_recal.bam' from control_refined_bam_ch1 
+          path 'ctl_recal.bai' from control_refined_bai_ch1
           path 'splited.interval_list' from split_bed_ch.flatten()
 
     output:
@@ -715,14 +748,17 @@ process somatic_gatk_mutect2_parallel_paired {
     
     script:
          raw_vcf = "${params.SampleId}_mutect2_raw.vcf"
-         vcf_stats = "${params.SampleId}_mutect2_raw.vcf.stats"
+         vcf_stats = "${params.SampleId}_mutect2.vcf.stats"
          f1r2_stat = "${params.SampleId}_f1r2.tar.gz"
          pileup_stat = "${params.SampleId}_getpileupsummaries.table"
     """
     cat ${mutect2_conf} | xargs \
     gatk Mutect2 -I tumor_refined.bam -I ctl_recal.bam -normal "${params.SampleId}_X" -R ${ref_fa} -alleles ${core_hotspots_conf} \
                  -germline-resource ${gatk_db_dir}/b37_af-only-gnomad.raw.sites.vcf -pon ${gatk_db_dir}/b37_yunying_pon.vcf \
-                 --f1r2-tar-gz ${f1r2_stat} -L splited.interval_list --native-pair-hmm-threads ${task.cpus} -O ${raw_vcf}
+                 --f1r2-tar-gz ${f1r2_stat} -L splited.interval_list --native-pair-hmm-threads ${task.cpus} -O "${params.SampleId}_mutect2.vcf"
+
+    cat ${secondary_annotate_conf} | xargs \
+    gatk VariantAnnotator -I tumor_refined.bam -R ${ref_fa} -V "${params.SampleId}_mutect2.vcf" -O ${raw_vcf}
 
     gatk GetPileupSummaries -I tumor_refined.bam -V ${gatk_db_dir}/b37_small_exac_common_3.vcf \
                  --interval-set-rule UNION -L splited.interval_list -O ${pileup_stat}
@@ -732,7 +768,7 @@ process somatic_gatk_mutect2_parallel_paired {
 
 
 process somatic_gatk_mutect2_tumor_only {
-    container '10.168.2.67:5000/gatk-yy:4.2.0.0'
+    container '10.168.2.67:5000/gatk-yy:4.2.2.1'
 
     cpus 2
     memory { 8.GB * task.attempt }
@@ -756,14 +792,17 @@ process somatic_gatk_mutect2_tumor_only {
     
     script:
          raw_vcf = "${params.SampleId}_mutect2_raw.vcf"
-         vcf_stats = "${params.SampleId}_mutect2_raw.vcf.stats"
+         vcf_stats = "${params.SampleId}_mutect2.vcf.stats"
          f1r2_stat = "${params.SampleId}_f1r2.tar.gz"
          pileup_stat = "${params.SampleId}_getpileupsummaries.table"
     """
     cat ${mutect2_conf} | xargs \
     gatk Mutect2 -I tumor_refined.bam -R ${ref_fa} -alleles ${core_hotspots_conf} \
                  -germline-resource ${gatk_db_dir}/b37_af-only-gnomad.raw.sites.vcf -pon ${gatk_db_dir}/b37_yunying_pon.vcf \
-                 --f1r2-tar-gz ${f1r2_stat} -L splited.interval_list --native-pair-hmm-threads ${task.cpus} -O ${raw_vcf}
+                 --f1r2-tar-gz ${f1r2_stat} -L splited.interval_list --native-pair-hmm-threads ${task.cpus} -O "${params.SampleId}_mutect2.vcf"
+
+    cat ${secondary_annotate_conf} | xargs \
+    gatk VariantAnnotator -I tumor_refined.bam -R ${ref_fa} -V "${params.SampleId}_mutect2.vcf" -O ${raw_vcf}
 
     gatk GetPileupSummaries -I tumor_refined.bam -V ${gatk_db_dir}/b37_small_exac_common_3.vcf \
                  --interval-set-rule UNION -L splited.interval_list -O ${pileup_stat}
@@ -772,7 +811,7 @@ process somatic_gatk_mutect2_tumor_only {
 }
 
 process somatic_gatk_filter_mark_paired {
-    container '10.168.2.67:5000/gatk-yy:4.1.7.2'
+    container '10.168.2.67:5000/gatk-yy:4.2.0.0'
     publishDir "${raw_unfilter_dir}", mode: 'copy'
     // *** this mount volume is used for local executation for docker, not necessary for kubernetes!!!
     containerOptions '-v /home/yunying/:/home/yunying/'
@@ -815,7 +854,7 @@ process somatic_gatk_filter_mark_paired {
 }
 
 process somatic_gatk_filter_mark_tumor_only {
-    container '10.168.2.67:5000/gatk-yy:4.1.7.2'
+    container '10.168.2.67:5000/gatk-yy:4.2.0.0'
     publishDir "${raw_unfilter_dir}", mode: 'copy'
     // *** this mount volume is used for local executation for docker, not necessary for kubernetes!!!
     containerOptions '-v /home/yunying/:/home/yunying/'
@@ -871,6 +910,7 @@ process anno_snpeff_hgvs_paired {
     
     input:
          path 'all_marked.vcf' from filter_marked_paired_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
     output:
          path '*.anno' into haplotype_anno_paired_ch
@@ -880,7 +920,7 @@ process anno_snpeff_hgvs_paired {
         prefix_anno_vcf = "${params.SampleId}_filter_marked"
     """
     python3 /opt/vcf_multiple_split.py all_marked.vcf all_marked_splitted.vcf
-    cat ${anno_snpeff_conf} | xargs \
+    cat anno_snpeff.conf | xargs \
     java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
              -haplotype-ouput ${prefix_anno_vcf}.haplotype.anno GRCh37.p13.RefSeq all_marked_splitted.vcf > ${prefix_anno_vcf}_hgvs.vcf
     """
@@ -926,6 +966,7 @@ process anno_snpeff_hgvs_tumor_only {
 
     input:
          path 'all_marked.vcf' from filter_marked_tumor_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
     output:
          path '*.anno' into haplotype_anno_tumor_ch
@@ -935,7 +976,7 @@ process anno_snpeff_hgvs_tumor_only {
          prefix_anno_vcf = "${params.SampleId}_filter_marked"
     """
     python3 /opt/vcf_multiple_split.py all_marked.vcf all_marked_splitted.vcf
-    cat ${anno_snpeff_conf} | xargs \
+    cat anno_snpeff.conf | xargs \
     java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
              -haplotype-ouput ${prefix_anno_vcf}.haplotype.anno GRCh37.p13.RefSeq all_marked_splitted.vcf > ${prefix_anno_vcf}_hgvs.vcf
     """
@@ -992,9 +1033,7 @@ process mutect2_report_paired {
      script:
          report_output = "${params.SampleId}_review_for_report.xls"
      """
-     awk -F '\t' '{if (!/^#/) print \$1"\t"\$2-1"\t"\$2}' marked_all_anno.vcf > all_sites.bed
-     samtools mpileup -f ${ref_fa} -Q 10 --ff UNMAP,SECONDARY,QCFAIL -d 50000 -a -B -x -l all_sites.bed -o all_sites.mpileup tumor_recal.bam
-     python3 /opt/vcf2mut_report_review.py marked_all_anno.vcf haplotype.anno ${variation_hotspots_conf} all_sites.mpileup ${report_output} ${params.PanelName}
+     python3 /opt/vcf2mut_report_review.py marked_all_anno.vcf haplotype.anno ${variation_hotspots_conf} all_sites.mpileup ${report_output}
      """
 }
 
@@ -1023,9 +1062,7 @@ process mutect2_report_tumor_only {
      script:
          report_output = "${params.SampleId}_review_for_report.xls"
      """
-     awk -F '\t' '{if (!/^#/) print \$1"\t"\$2-1"\t"\$2}' marked_all_anno.vcf > all_sites.bed
-     samtools mpileup -f ${ref_fa} -Q 10 --ff UNMAP,SECONDARY,QCFAIL -d 50000 -a -B -x -l all_sites.bed -o all_sites.mpileup tumor_recal.bam
-     python3 /opt/vcf2mut_report_review.py marked_all_anno.vcf haplotype.anno ${variation_hotspots_conf} all_sites.mpileup ${report_output} ${params.PanelName}
+     python3 /opt/vcf2mut_report_review.py marked_all_anno.vcf haplotype.anno ${variation_hotspots_conf} all_sites.mpileup ${report_output}
      """
 }
 
@@ -1207,6 +1244,7 @@ process anno_germline_snpeff_control {
     
     input:
          path 'germline_control.vcf' from control_germline_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
     output:
          path "${germline_anno_vcf}" into germline_anno_ch
@@ -1218,7 +1256,7 @@ process anno_germline_snpeff_control {
         germline_radio_xls = "${params.SampleId}_radiotherapy_rs.xls"
     """
     python3 /opt/vcf_multiple_split.py germline_control.vcf germline_control_splitted.vcf
-    cat ${anno_snpeff_conf} | xargs \
+    cat anno_snpeff.conf | xargs \
     java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
                      -haplotype-ouput haplotype.anno GRCh37.p13.RefSeq germline_control_splitted.vcf > ${germline_anno_vcf}
     python3 /opt/chemotherapy_to_report.py germline_control.vcf ${chemotherapy_rs_vcf} ${germline_chemo_xls} 
@@ -1243,6 +1281,7 @@ process anno_germline_snpeff_tumor {
     
     input:
          path 'germline_tumor.vcf' from tumor_germline_ch
+         path 'anno_snpeff.conf' from anno_snpeff_conf 
 
     output:
          path "${germline_tumor_anno_vcf}" into tumor_germline_anno_ch, tumor_germline_anno_ch2
@@ -1254,7 +1293,7 @@ process anno_germline_snpeff_tumor {
         tumor_radio_xls = "${params.SampleId}_radiotherapy_rs.xls"
     """
     python3 /opt/vcf_multiple_split.py germline_tumor.vcf germline_tumor_splitted.vcf
-    cat ${anno_snpeff_conf} | xargs \
+    cat anno_snpeff.conf | xargs \
     java -Xmx4g -jar /opt/SnpEff-4.4-jar-with-dependencies.jar -c /opt/snpEff.config \
                      -haplotype-ouput haplotype.anno GRCh37.p13.RefSeq germline_tumor_splitted.vcf > ${germline_tumor_anno_vcf}
     python3 /opt/chemotherapy_to_report.py germline_tumor.vcf ${chemotherapy_rs_vcf} ${tumor_chemo_xls}
